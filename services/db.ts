@@ -408,9 +408,15 @@ export const dbAppointments = {
           id: `apt${Date.now()}`,
           status: AppointmentStatus.PENDING
         };
-        // Garantir que o usuário existe na tabela `users` antes de inserir o agendamento
+        // Garantir que o usuário existe na tabela `users` antes de inserir o agendamento.
+        // Usamos `maybeSingle()` para não lançar erro se não houver linha, e `upsert` para garantir
+        // criação/upsert atômico. Caso o upsert falhe (ex: RLS), abortamos a tentativa de inserir o
+        // agendamento no Supabase e caímos para o fallback localStorage.
         try {
-          const { data: existingUser } = await supabase.from('users').select('*').eq('id', newItem.userId).single();
+          const { data: existingUser, error: fetchErr } = await supabase.from('users').select('*').eq('id', newItem.userId).maybeSingle();
+          if (fetchErr) {
+            console.warn('Error fetching user before appointment insert:', fetchErr);
+          }
           if (!existingUser) {
             const userToCreate: User = {
               id: newItem.userId,
@@ -419,22 +425,32 @@ export const dbAppointments = {
               role: newItem.userId?.startsWith('guest') ? ('GUEST' as Role) : ('CLIENT' as Role),
               avatarUrl: ''
             };
-            const { data: createdUser, error: userInsertError } = await supabase
+
+            const { data: upsertedUser, error: userUpsertError } = await supabase
               .from('users')
-              .insert([mapUserToDB(userToCreate)])
+              .upsert([mapUserToDB(userToCreate)])
               .select()
-              .single();
-            if (userInsertError) {
-              console.warn('Supabase user create failed while creating appointment, continuing with fallback:', userInsertError);
-            } else if (createdUser) {
-              // update localStorage users
+              .maybeSingle();
+
+            if (userUpsertError) {
+              console.warn('Supabase user upsert failed while creating appointment:', userUpsertError);
+              if (userUpsertError.code === '42501' || (userUpsertError?.message && String(userUpsertError.message).toLowerCase().includes('row-level security'))) {
+                console.warn('\nRow-Level Security is blocking inserts to `users`. To fix, run the following SQL in Supabase SQL Editor (development only):\n');
+                console.warn("-- Allow public inserts on users (for development)\nCREATE POLICY \"Allow public insert on users\" ON users FOR INSERT USING (true) WITH CHECK (true);\n\n-- Or disable RLS temporarily (not recommended for production)\nALTER TABLE users DISABLE ROW LEVEL SECURITY;\n");
+              }
+              // If we can't create the user in Supabase, throw to avoid a FK violation when inserting appointment
+              throw userUpsertError;
+            }
+
+            if (upsertedUser) {
               const users = getCollection<User>(KEYS.USERS);
-              users.push(mapUserFromDB(createdUser));
+              users.push(mapUserFromDB(upsertedUser));
               saveCollection(KEYS.USERS, users);
             }
           }
         } catch (uErr) {
-          console.warn('Error checking/creating user before appointment insert:', uErr);
+          console.warn('Error ensuring user exists before appointment insert — aborting Supabase appointment insert and falling back to localStorage:', uErr);
+          throw uErr;
         }
         const { data: created, error } = await supabase
           .from('appointments')
