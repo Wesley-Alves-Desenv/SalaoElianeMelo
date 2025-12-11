@@ -452,18 +452,69 @@ export const dbAppointments = {
           console.warn('Error ensuring user exists before appointment insert — aborting Supabase appointment insert and falling back to localStorage:', uErr);
           throw uErr;
         }
-        const { data: created, error } = await supabase
-          .from('appointments')
-          .insert([mapAppointmentToDB(newItem)])
-          .select()
-          .single();
-        if (error) throw error;
-        if (created) {
-          const mapped = mapAppointmentFromDB(created);
-          const items = getCollection<Appointment>(KEYS.APPOINTMENTS);
-          items.push(mapped);
-          saveCollection(KEYS.APPOINTMENTS, items);
-          return mapped;
+        // Insert appointment with retry on foreign-key violation (23503)
+        try {
+          const { data: created, error } = await supabase
+            .from('appointments')
+            .insert([mapAppointmentToDB(newItem)])
+            .select()
+            .single();
+          if (error) throw error;
+          if (created) {
+            const mapped = mapAppointmentFromDB(created);
+            const items = getCollection<Appointment>(KEYS.APPOINTMENTS);
+            items.push(mapped);
+            saveCollection(KEYS.APPOINTMENTS, items);
+            return mapped;
+          }
+        } catch (insErr: any) {
+          // If FK violation because user is missing, try to upsert the user and retry once
+          const code = insErr?.code || (insErr?.details && insErr.details.code) || null;
+          console.warn('Supabase appointment insert error:', insErr);
+          if (code === '23503' || (insErr?.message && String(insErr.message).toLowerCase().includes('foreign key'))) {
+            console.warn('Foreign key violation detected while inserting appointment — attempting to ensure user exists and retry.');
+            try {
+              const userToCreate: User = {
+                id: newItem.userId,
+                name: newItem.userName || 'Visitante',
+                email: newItem.clientEmail || '',
+                role: newItem.userId?.startsWith('guest') ? ('GUEST' as Role) : ('CLIENT' as Role),
+                avatarUrl: ''
+              };
+              const { data: upsertedUser2, error: userUpsertError2 } = await supabase
+                .from('users')
+                .upsert([mapUserToDB(userToCreate)])
+                .select()
+                .maybeSingle();
+              if (userUpsertError2) {
+                console.warn('Retry user upsert failed:', userUpsertError2);
+                throw userUpsertError2;
+              }
+              if (upsertedUser2) {
+                const users = getCollection<User>(KEYS.USERS);
+                users.push(mapUserFromDB(upsertedUser2));
+                saveCollection(KEYS.USERS, users);
+              }
+              // Retry appointment insert once
+              const { data: created2, error: error2 } = await supabase
+                .from('appointments')
+                .insert([mapAppointmentToDB(newItem)])
+                .select()
+                .single();
+              if (error2) throw error2;
+              if (created2) {
+                const mapped2 = mapAppointmentFromDB(created2);
+                const items2 = getCollection<Appointment>(KEYS.APPOINTMENTS);
+                items2.push(mapped2);
+                saveCollection(KEYS.APPOINTMENTS, items2);
+                return mapped2;
+              }
+            } catch (retryErr) {
+              console.warn('Retry after user upsert failed, falling back to localStorage:', retryErr);
+              throw retryErr;
+            }
+          }
+          throw insErr;
         }
       } catch (error) {
         console.warn('Supabase appointment create failed, using localStorage:', error);
