@@ -116,7 +116,7 @@ const mapAppointmentFromDB = (data: any): Appointment => ({
 const mapUserToDB = (user: User) => ({
   id: user.id,
   name: user.name,
-  email: user.email,
+  email: user.email || null,
   role: user.role || 'CLIENT',
   avatar_url: user.avatarUrl || null,
 });
@@ -428,7 +428,7 @@ export const dbAppointments = {
 
             const { data: upsertedUser, error: userUpsertError } = await supabase
               .from('users')
-              .upsert([mapUserToDB(userToCreate)])
+              .upsert([mapUserToDB(userToCreate)], { onConflict: 'id' })
               .select()
               .maybeSingle();
 
@@ -483,7 +483,7 @@ export const dbAppointments = {
               };
               const { data: upsertedUser2, error: userUpsertError2 } = await supabase
                 .from('users')
-                .upsert([mapUserToDB(userToCreate)])
+                .upsert([mapUserToDB(userToCreate)], { onConflict: 'id' })
                 .select()
                 .maybeSingle();
               if (userUpsertError2) {
